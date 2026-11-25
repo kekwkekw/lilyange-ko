@@ -1,13 +1,13 @@
 {
   "schema": 1,
   "game": "lilyange",
-  "generated_at": "2026-11-25T15:06:33Z",
+  "generated_at": "2026-11-25T16:23:09Z",
   "registry_freeze_id": "FRIDA_ANDROID_RUNTIME_REGISTRY_86123_STAGE50_1_20261019",
   "stats": {
     "scenario_scripts": 1041,
     "scenario_fragments": 86123,
-    "ui_entries": 1797,
-    "ui_extra_static_merged": 0,
+    "ui_entries": 2537,
+    "ui_extra_static_merged": 740,
     "ui_scoped_entries": 53,
     "names_entries": 547,
     "api_dict_endpoints": 11,
@@ -22,8 +22,8 @@
     },
     "ui": {
       "path": "translations/ko/ui.json",
-      "sha256": "b07c026703492319c0cb366a7ad10d98e1f12903399c9a084efbd86d0e2dd481",
-      "bytes": 208895
+      "sha256": "378a11062444ad80217a8f134ff97b16c85f49229de8588914fcfbf4faf184c1",
+      "bytes": 254963
     },
     "ui_scoped": {
       "path": "translations/ko/ui_scoped.json",
