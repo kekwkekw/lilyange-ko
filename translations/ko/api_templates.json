@@ -1,0 +1,43 @@
+[
+  {
+    "id": "mission_remaining_hours_minutes",
+    "endpoint": "/mission_index",
+    "method": "POST",
+    "paths": [
+      "daily_list[].date"
+    ],
+    "source_regex": "^あと([0-9０-９]+)時間([0-9０-９]+)分$",
+    "ko_format": "{0}시간 {1}분"
+  },
+  {
+    "id": "mission_remaining_days_hours_minutes",
+    "endpoint": "/mission_index",
+    "method": "POST",
+    "paths": [
+      "weekly_list[].date",
+      "event_list[].date"
+    ],
+    "source_regex": "^あと([0-9０-９]+)日と([0-9０-９]+)時間([0-9０-９]+)分$",
+    "ko_format": "{0}일 {1}시간 {2}분"
+  },
+  {
+    "id": "gacha_remaining_days",
+    "endpoint": "/gacha_index",
+    "method": "GET",
+    "paths": [
+      "gacha_canvas.gacha_list[].banner_date"
+    ],
+    "source_regex": "^あと([0-9０-９]+)日$",
+    "ko_format": "{0}일"
+  },
+  {
+    "id": "loginpass_month_day",
+    "endpoint": "/loginpass_index",
+    "method": "POST",
+    "paths": [
+      "loginpass_list[].day_list[].day_text_date"
+    ],
+    "source_regex": "^([0-9０-９]+)月([0-9０-９]+)日$",
+    "ko_format": "{0}월 {1}일"
+  }
+]
