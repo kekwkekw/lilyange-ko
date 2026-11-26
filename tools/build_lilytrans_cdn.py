@@ -26,10 +26,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 DEFAULT_FRIDA_ZIP = r"D:\lily_workspace\android_research\refs\FRIDA_STAGE50_1_FULL_RUNTIME_REGISTRY_20261019.zip"
 DEFAULT_BRIDGE_ZIP = r"D:\lily_workspace\android_research\refs\LILYANGE_UI_PUBLIC_PATCH_BRIDGE_20261027.zip"
+DEFAULT_FINAL_R2_ZIP = r"D:\Downloads\LILYANGE_DELETE_SAFE_FRIDA_TRANSFER_20261115_R2.zip"
+DEFAULT_CRAWLER_EXTRACTED_DIR = r"D:\lily_workspace\crawler_work\extracted"
 DEFAULT_OUT_DIR = r"D:\lily_workspace\lilytrans"
 
 FORBIDDEN_EXTENSIONS = {".unityweb", ".bundle", ".assets", ".apk", ".so", ".dll"}
-EXPECTED_SCENARIO_FRAGMENTS = 86123
+MIN_EXPECTED_SCENARIO_FRAGMENTS = 86123
 
 WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
@@ -222,16 +224,53 @@ def iter_frida_fragments(zf: zipfile.ZipFile) -> Iterable[Dict[str, Any]]:
                                 yield item
 
 
+def _load_live_extracted_printtext(extracted_dir: Path) -> Dict[Tuple[str, int, int], Dict[str, Any]]:
+    ext_map: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+    if not extracted_dir.is_dir():
+        return ext_map
+    for p in extracted_dir.rglob("naninovel.jsonl"):
+        if "apk_builtin" in p.parts:
+            continue
+        for raw_line in p.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            rec = json.loads(raw_line)
+            if rec.get("command_class") != "PrintText":
+                continue
+            pb = rec.get("playback_spot") or {}
+            sc = str(pb.get("scriptName") or rec.get("script_m_name") or "").strip()
+            if not sc:
+                continue
+            li = int(pb.get("lineIndex", -1))
+            ii = int(pb.get("inlineIndex", 0))
+            ext_map[(sc, li, ii)] = rec
+    return ext_map
+
+
 def build_scenarios(
     frida_zf: zipfile.ZipFile,
     out_dir: Path,
-) -> Tuple[Dict[str, Dict[str, Any]], int, int]:
+    *,
+    final_r2_zip: Optional[Path] = None,
+    crawler_extracted_dir: Optional[Path] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], int, int, Dict[str, int]]:
     """
     Build translations/ko/scenarios/<group>/<scriptName>.json and scenario_index.json.
-    Returns (scenario_index, script_count, total_fragment_count).
+    Follows STAGE50_1_BASELINE_PREFERRED_WITH_DETERMINISTIC_FALLBACK:
+    - Preserves all 86,123 Stage50.1 fragments (including B18 semantic coalesced splits).
+    - Promotes additional approved non-HOLD fragments from FINAL 88,868 verified against
+      live catalog extraction + logical master lineHash.
+    - Applies deterministic zero-retranslation runtime alignment (CJK compat-kanji guard
+      hash & shifted lineIndex remap where (lineHash, guard) uniquely match live bundles).
     """
-    # scriptName -> list of (lineIndex, inlineIndex, payload)
-    scripts: Dict[str, List[Tuple[int, int, Dict[str, Any]]]] = defaultdict(list)
+    # scriptName -> dict of (lineIndex, inlineIndex) -> payload
+    scripts: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = defaultdict(dict)
+    promo_stats: Dict[str, int] = {
+        "stage50_1_base": 0,
+        "final_new_promoted": 0,
+        "compat_kanji_guard_aligned": 0,
+        "shifted_keys_remapped": 0,
+    }
 
     for rec in iter_frida_fragments(frida_zf):
         script_name = str(rec.get("scriptName", "")).strip()
@@ -252,9 +291,131 @@ def build_scenarios(
             "g": str(rec.get("source_guard_sha256", "")),
             "t": str(rec.get("replacement_ko", "")),
         }
-        scripts[script_name].append((line_idx, inline_idx, payload))
+        scripts[script_name][(line_idx, inline_idx)] = payload
+        promo_stats["stage50_1_base"] += 1
 
-    scenarios_root = out_dir / "translations" / "ko" / "scenarios"
+    ext_map: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+    if crawler_extracted_dir and crawler_extracted_dir.is_dir():
+        ext_map = _load_live_extracted_printtext(crawler_extracted_dir)
+
+    # Promote approved FINAL 88,868 delta fragments (zero translation edits)
+    if final_r2_zip and final_r2_zip.is_file() and ext_map:
+        with zipfile.ZipFile(final_r2_zip, "r") as r2_zf:
+            frag_member = find_zip_member(r2_zf, "FRIDA_FINAL_RUNTIME_FRAGMENT_REGISTRY_88868.jsonl")
+            logical_member = find_zip_member(r2_zf, "FRIDA_FINAL_RUNTIME_LOGICAL_MASTER_85125.jsonl")
+            if frag_member and logical_member:
+                logical_lh: Dict[str, str] = {}
+                for lrec in iter_jsonl_from_zip(r2_zf, logical_member):
+                    lk = str(lrec.get("key", "")).strip()
+                    if lk:
+                        logical_lh[lk] = str(lrec.get("lineHash", ""))
+
+                for frec in iter_jsonl_from_zip(r2_zf, frag_member):
+                    if frec.get("hold") is True:
+                        continue
+                    sc = str(frec.get("scriptName", "")).strip()
+                    if not sc:
+                        continue
+                    li = int(frec.get("lineIndex", 0))
+                    ii = int(frec.get("inlineIndex", 0))
+                    if (li, ii) in scripts[sc]:
+                        continue  # Stage50.1 baseline preferred
+                    ex = ext_map.get((sc, li, ii))
+                    if ex is None:
+                        raise RuntimeError(f"FINAL fragment {(sc, li, ii)} missing in live crawler extraction")
+                    live_lh = str(ex.get("line_hash", ""))
+                    lk = str(frec.get("logicalKey", ""))
+                    expected_lh = logical_lh.get(lk, "")
+                    if expected_lh and live_lh and expected_lh != live_lh:
+                        raise RuntimeError(
+                            f"FINAL fragment {(sc, li, ii)} lineHash mismatch: logical={expected_lh} live={live_lh}"
+                        )
+                    t_ko = str(frec.get("translation_ko", ""))
+                    g_tpl = str(ex.get("source_guard_sha256_player_template") or "")
+                    g_exact = str(ex.get("source_guard_sha256_exact") or "")
+                    if g_tpl:
+                        mode_int = 1
+                        guard_sha = g_tpl
+                    elif g_exact:
+                        mode_int = 0
+                        guard_sha = g_exact
+                    else:
+                        raise RuntimeError(f"FINAL fragment {(sc, li, ii)} has empty live guard hash")
+
+                    scripts[sc][(li, ii)] = {
+                        "lh": live_lh or expected_lh,
+                        "m": mode_int,
+                        "g": guard_sha,
+                        "t": t_ko,
+                    }
+                    promo_stats["final_new_promoted"] += 1
+
+    # Deterministic zero-retranslation runtime alignment against live extracted bundles
+    if ext_map:
+        ext_by_sc: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = defaultdict(dict)
+        for (sc, li, ii), rec in ext_map.items():
+            ext_by_sc[sc][(li, ii)] = rec
+
+        for sc, frag_map in list(scripts.items()):
+            live_sc = ext_by_sc.get(sc)
+            if not live_sc:
+                continue
+
+            # 1) CJK compatibility ideograph 海(U+FA45) vs 海(U+6D77) guard hash alignment
+            for (li, ii), payload in frag_map.items():
+                ex = live_sc.get((li, ii))
+                if ex is None or payload["m"] != 0:
+                    continue
+                if str(ex.get("line_hash", "")) != payload["lh"]:
+                    continue
+                ge = str(ex.get("source_guard_sha256_exact") or "")
+                if not ge or ge == payload["g"]:
+                    continue
+                raw_val = str((ex.get("text") or {}).get("value") or "")
+                if "\ufa45" in raw_val:
+                    norm_sha = sha256_bytes(raw_val.replace("\ufa45", "\u6d77").encode("utf-8"))
+                    if norm_sha == payload["g"]:
+                        payload["g"] = ge
+                        promo_stats["compat_kanji_guard_aligned"] += 1
+
+            # 2) Shifted lineIndex remap (only for entries whose current key fails live match)
+            def _matches_live(key_pair: Tuple[int, int], p: Dict[str, Any]) -> bool:
+                ex = live_sc.get(key_pair)
+                if ex is None or str(ex.get("line_hash", "")) != p["lh"]:
+                    return False
+                expected_g = str(
+                    ex.get("source_guard_sha256_player_template") if p["m"] == 1 else ex.get("source_guard_sha256_exact")
+                ) or ""
+                return expected_g == p["g"]
+
+            broken_keys = [k for k, p in frag_map.items() if not _matches_live(k, p)]
+            if broken_keys:
+                live_lookup: Dict[Tuple[str, int, str], List[Tuple[int, int]]] = defaultdict(list)
+                for lk_pair, ex in live_sc.items():
+                    lh = str(ex.get("line_hash", ""))
+                    ge = str(ex.get("source_guard_sha256_exact") or "")
+                    gt = str(ex.get("source_guard_sha256_player_template") or "")
+                    if ge:
+                        live_lookup[(lh, 0, ge)].append(lk_pair)
+                    if gt:
+                        live_lookup[(lh, 1, gt)].append(lk_pair)
+
+                remapped: Dict[Tuple[int, int], Dict[str, Any]] = {
+                    k: p for k, p in frag_map.items() if k not in set(broken_keys)
+                }
+                for old_k in sorted(broken_keys):
+                    p = frag_map[old_k]
+                    cands = [
+                        ck for ck in live_lookup.get((p["lh"], p["m"], p["g"]), [])
+                        if ck not in remapped
+                    ]
+                    if len(cands) == 1:
+                        remapped[cands[0]] = p
+                        promo_stats["shifted_keys_remapped"] += 1
+                    else:
+                        remapped[old_k] = p
+                scripts[sc] = remapped
+
     scenario_index: Dict[str, Dict[str, Any]] = {}
     used_rel_paths: Dict[str, str] = {}
     total_fragments = 0
@@ -270,11 +431,10 @@ def build_scenarios(
             rel_path = f"translations/ko/scenarios/{group}/{safe_base}_{suffix}.json"
         used_rel_paths[rel_path.lower()] = script_name
 
-        entries = scripts[script_name]
-        entries.sort(key=lambda x: (x[0], x[1]))
+        entries = sorted(scripts[script_name].items(), key=lambda x: (x[0][0], x[0][1]))
 
         fragments_map: Dict[str, Dict[str, Any]] = {}
-        for line_idx, inline_idx, payload in entries:
+        for (line_idx, inline_idx), payload in entries:
             fragments_map[f"{line_idx}:{inline_idx}"] = payload
 
         doc = {
@@ -294,7 +454,7 @@ def build_scenarios(
             "bytes": size,
         }
 
-    return scenario_index, len(scenario_index), total_fragments
+    return scenario_index, len(scenario_index), total_fragments, promo_stats
 
 
 def _extract_string(d: Dict[str, Any], *keys: str) -> str:
@@ -660,9 +820,10 @@ def verify_output(out_dir: Path) -> Dict[str, Any]:
     if source_jp_leaks > 0:
         errors.append(f"Found {source_jp_leaks} source_jp keys inside scenarios/")
 
-    if total_fragments != EXPECTED_SCENARIO_FRAGMENTS:
+    expected_in_manifest = manifest.get("stats", {}).get("scenario_fragments", MIN_EXPECTED_SCENARIO_FRAGMENTS)
+    if total_fragments < MIN_EXPECTED_SCENARIO_FRAGMENTS or total_fragments != expected_in_manifest:
         errors.append(
-            f"Total scenario fragments mismatch: {total_fragments} != {EXPECTED_SCENARIO_FRAGMENTS}"
+            f"Total scenario fragments mismatch: {total_fragments} != manifest {expected_in_manifest} (min {MIN_EXPECTED_SCENARIO_FRAGMENTS})"
         )
 
     return {
@@ -680,8 +841,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build Lilianze (lilyange) gctrans-inspired CDN repository."
     )
-    parser.add_argument("--frida-zip", default=DEFAULT_FRIDA_ZIP, help="Path to FRIDA runtime registry zip.")
+    parser.add_argument("--frida-zip", default=DEFAULT_FRIDA_ZIP, help="Path to FRIDA Stage50.1 runtime registry zip.")
     parser.add_argument("--bridge-zip", default=DEFAULT_BRIDGE_ZIP, help="Path to UI public patch bridge zip.")
+    parser.add_argument("--final-r2-zip", default=DEFAULT_FINAL_R2_ZIP, help="Optional FRIDA FINAL 88,868 transfer R2 zip.")
+    parser.add_argument("--crawler-extracted-dir", default=DEFAULT_CRAWLER_EXTRACTED_DIR, help="Optional live crawler extracted dir for guard/key verification.")
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help="Output CDN repository directory.")
     parser.add_argument(
         "--verify",
@@ -716,9 +879,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     ko_dir = out_dir / "translations" / "ko"
     ko_dir.mkdir(parents=True, exist_ok=True)
 
+    final_r2_path = Path(args.final_r2_zip) if args.final_r2_zip else None
+    crawler_ext_path = Path(args.crawler_extracted_dir) if args.crawler_extracted_dir else None
+
     with zipfile.ZipFile(frida_zip_path, "r") as frida_zf:
         registry_freeze_id = extract_registry_freeze_id(frida_zf, frida_zip_path)
-        scenario_index, script_count, total_fragments = build_scenarios(frida_zf, out_dir)
+        scenario_index, script_count, total_fragments, promo_stats = build_scenarios(
+            frida_zf,
+            out_dir,
+            final_r2_zip=final_r2_path,
+            crawler_extracted_dir=crawler_ext_path,
+        )
+    if promo_stats.get("final_new_promoted", 0) > 0:
+        registry_freeze_id = "FRIDA_FINAL_BINARY_HOLD_MASTER_20261023_STAGE50_1_PREFERRED"
 
     with zipfile.ZipFile(bridge_zip_path, "r") as bridge_zf:
         (
@@ -789,6 +962,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "stats": {
             "scenario_scripts": script_count,
             "scenario_fragments": total_fragments,
+            "scenario_promotion": promo_stats,
             "ui_entries": len(ui_dict),
             "ui_extra_static_merged": extra_static_count,
             "ui_scoped_entries": len(ui_scoped_dict),

@@ -1,11 +1,17 @@
 {
   "schema": 1,
   "game": "lilyange",
-  "generated_at": "2026-11-25T16:23:09Z",
-  "registry_freeze_id": "FRIDA_ANDROID_RUNTIME_REGISTRY_86123_STAGE50_1_20261019",
+  "generated_at": "2026-11-26T07:41:36Z",
+  "registry_freeze_id": "FRIDA_FINAL_BINARY_HOLD_MASTER_20261023_STAGE50_1_PREFERRED",
   "stats": {
-    "scenario_scripts": 1041,
-    "scenario_fragments": 86123,
+    "scenario_scripts": 1042,
+    "scenario_fragments": 88868,
+    "scenario_promotion": {
+      "stage50_1_base": 86192,
+      "final_new_promoted": 2745,
+      "compat_kanji_guard_aligned": 4,
+      "shifted_keys_remapped": 29
+    },
     "ui_entries": 2537,
     "ui_extra_static_merged": 740,
     "ui_scoped_entries": 53,
@@ -17,8 +23,8 @@
   "core": {
     "scenario_index": {
       "path": "translations/ko/scenario_index.json",
-      "sha256": "b82456ccbc9fc8b3039c4a865ba7b1ff6a2f8c8b7e6d2c29f7d9e97e598cd5ad",
-      "bytes": 180409
+      "sha256": "c55fa981bbedf039f25cdb0a6cbf2efd1e20762f7ab8655792a295ba38f6725c",
+      "bytes": 180647
     },
     "ui": {
       "path": "translations/ko/ui.json",
