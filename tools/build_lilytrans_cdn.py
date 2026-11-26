@@ -28,6 +28,7 @@ DEFAULT_FRIDA_ZIP = r"D:\lily_workspace\android_research\refs\FRIDA_STAGE50_1_FU
 DEFAULT_BRIDGE_ZIP = r"D:\lily_workspace\android_research\refs\LILYANGE_UI_PUBLIC_PATCH_BRIDGE_20261027.zip"
 DEFAULT_FINAL_R2_ZIP = r"D:\Downloads\LILYANGE_DELETE_SAFE_FRIDA_TRANSFER_20261115_R2.zip"
 DEFAULT_CRAWLER_EXTRACTED_DIR = r"D:\lily_workspace\crawler_work\extracted"
+DEFAULT_R2_HANDOFF_DIR = r"D:\lily_workspace\handoff_r2_20261126\FRIDA_AG_INTEGRATED_TRANSLATION_HANDOFF_20261126_R2"
 DEFAULT_OUT_DIR = r"D:\lily_workspace\lilytrans"
 
 FORBIDDEN_EXTENSIONS = {".unityweb", ".bundle", ".assets", ".apk", ".so", ".dll"}
@@ -224,10 +225,13 @@ def iter_frida_fragments(zf: zipfile.ZipFile) -> Iterable[Dict[str, Any]]:
                                 yield item
 
 
-def _load_live_extracted_printtext(extracted_dir: Path) -> Dict[Tuple[str, int, int], Dict[str, Any]]:
-    ext_map: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+def _load_live_extracted_commands(
+    extracted_dir: Path,
+) -> Tuple[Dict[Tuple[str, int, int], Dict[str, Any]], Dict[Tuple[str, int, int], Dict[str, Any]]]:
+    pt_map: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+    ch_map: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
     if not extracted_dir.is_dir():
-        return ext_map
+        return pt_map, ch_map
     for p in extracted_dir.rglob("naninovel.jsonl"):
         if "apk_builtin" in p.parts:
             continue
@@ -235,7 +239,8 @@ def _load_live_extracted_printtext(extracted_dir: Path) -> Dict[Tuple[str, int, 
             if not raw_line.strip():
                 continue
             rec = json.loads(raw_line)
-            if rec.get("command_class") != "PrintText":
+            cmd = rec.get("command_class")
+            if cmd not in ("PrintText", "AddChoice"):
                 continue
             pb = rec.get("playback_spot") or {}
             sc = str(pb.get("scriptName") or rec.get("script_m_name") or "").strip()
@@ -243,8 +248,11 @@ def _load_live_extracted_printtext(extracted_dir: Path) -> Dict[Tuple[str, int, 
                 continue
             li = int(pb.get("lineIndex", -1))
             ii = int(pb.get("inlineIndex", 0))
-            ext_map[(sc, li, ii)] = rec
-    return ext_map
+            if cmd == "PrintText":
+                pt_map[(sc, li, ii)] = rec
+            else:
+                ch_map[(sc, li, ii)] = rec
+    return pt_map, ch_map
 
 
 def build_scenarios(
@@ -253,6 +261,8 @@ def build_scenarios(
     *,
     final_r2_zip: Optional[Path] = None,
     crawler_extracted_dir: Optional[Path] = None,
+    r2_handoff_dir: Optional[Path] = None,
+    include_review_required: bool = True,
 ) -> Tuple[Dict[str, Dict[str, Any]], int, int, Dict[str, int]]:
     """
     Build translations/ko/scenarios/<group>/<scriptName>.json and scenario_index.json.
@@ -262,6 +272,9 @@ def build_scenarios(
       live catalog extraction + logical master lineHash.
     - Applies deterministic zero-retranslation runtime alignment (CJK compat-kanji guard
       hash & shifted lineIndex remap where (lineHash, guard) uniquely match live bundles).
+    - Optionally merges verified R2 incremental handoff scenarios (01a/01b/02_addchoice)
+      without ever overwriting existing Stage50.1/FINAL 88,868 entries, normalizing
+      {G_PlayerName} -> {PLAYER_NAME} for runtime Mode 1 compatibility.
     """
     # scriptName -> dict of (lineIndex, inlineIndex) -> payload
     scripts: Dict[str, Dict[Tuple[int, int], Dict[str, Any]]] = defaultdict(dict)
@@ -270,6 +283,13 @@ def build_scenarios(
         "final_new_promoted": 0,
         "compat_kanji_guard_aligned": 0,
         "shifted_keys_remapped": 0,
+        "r2_01a_promoted": 0,
+        "r2_01b_promoted": 0,
+        "r2_review_required_included": 0,
+        "r2_choices_promoted": 0,
+        "r2_skipped_existing": 0,
+        "r2_excluded_skipped": 0,
+        "r2_player_token_normalized": 0,
     }
 
     for rec in iter_frida_fragments(frida_zf):
@@ -295,8 +315,9 @@ def build_scenarios(
         promo_stats["stage50_1_base"] += 1
 
     ext_map: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
+    ext_choice_map: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
     if crawler_extracted_dir and crawler_extracted_dir.is_dir():
-        ext_map = _load_live_extracted_printtext(crawler_extracted_dir)
+        ext_map, ext_choice_map = _load_live_extracted_commands(crawler_extracted_dir)
 
     # Promote approved FINAL 88,868 delta fragments (zero translation edits)
     if final_r2_zip and final_r2_zip.is_file() and ext_map:
@@ -415,6 +436,85 @@ def build_scenarios(
                     else:
                         remapped[old_k] = p
                 scripts[sc] = remapped
+
+    # Promote R2 incremental handoff scenarios (01a / 01b / 02_addchoice)
+    # Never overwrites existing Stage50.1 / FINAL 88,868 entries.
+    if r2_handoff_dir and r2_handoff_dir.is_dir() and ext_map:
+        r2_specs = [
+            ("01a", r2_handoff_dir / "02_integrated_stage_b" / "01a_new_scenarios_STAGE_B_INTEGRATED_8140.jsonl", ext_map),
+            ("01b", r2_handoff_dir / "02_integrated_stage_b" / "01b_updated_existing_STAGE_B_FROZEN_2935.jsonl", ext_map),
+            ("choice", r2_handoff_dir / "02_integrated_stage_b" / "02_addchoice_STAGE_B_FROZEN_0023.jsonl", ext_choice_map),
+        ]
+        for scope, fpath, live_lookup_map in r2_specs:
+            if not fpath.is_file():
+                continue
+            for raw_line in fpath.read_text(encoding="utf-8").splitlines():
+                if not raw_line.strip():
+                    continue
+                rec = json.loads(raw_line)
+                st = str(rec.get("review_status", "")).strip()
+                if st.startswith("EXCLUDED"):
+                    promo_stats["r2_excluded_skipped"] += 1
+                    continue
+                if st == "REVIEW_REQUIRED" and not include_review_required:
+                    continue
+                if st not in {"READY_FOR_EXPLICIT_ACCEPTANCE", "REVIEWED_REUSE_READY", "REVIEW_REQUIRED"}:
+                    raise RuntimeError(f"Unexpected R2 review_status {st!r} in {fpath.name}")
+
+                sc = str(rec.get("scriptName", "")).strip()
+                li = int(rec.get("lineIndex", 0))
+                ii = int(rec.get("inlineIndex", 0))
+                if not sc:
+                    continue
+                if (li, ii) in scripts[sc]:
+                    promo_stats["r2_skipped_existing"] += 1
+                    continue
+
+                ex = live_lookup_map.get((sc, li, ii))
+                if ex is None:
+                    raise RuntimeError(f"R2 {scope} fragment {(sc, li, ii)} missing in live crawler extraction")
+                live_lh = str(ex.get("line_hash", ""))
+                rec_lh = str(rec.get("lineHash", ""))
+                if rec_lh and live_lh and rec_lh != live_lh:
+                    raise RuntimeError(
+                        f"R2 {scope} fragment {(sc, li, ii)} lineHash mismatch: rec={rec_lh} live={live_lh}"
+                    )
+
+                t_ko = str(rec.get("translation_ko") or "")
+                if not t_ko.strip():
+                    raise RuntimeError(f"R2 {scope} fragment {(sc, li, ii)} has empty translation_ko")
+
+                g_tpl = str(ex.get("source_guard_sha256_player_template") or "")
+                g_exact = str(ex.get("source_guard_sha256_exact") or "")
+                if g_tpl:
+                    mode_int = 1
+                    guard_sha = g_tpl
+                    if "{G_PlayerName}" in t_ko:
+                        t_ko = t_ko.replace("{G_PlayerName}", "{PLAYER_NAME}")
+                        promo_stats["r2_player_token_normalized"] += 1
+                elif g_exact:
+                    mode_int = 0
+                    guard_sha = g_exact
+                else:
+                    raise RuntimeError(f"R2 {scope} fragment {(sc, li, ii)} has empty live guard hash")
+
+                if "{G_PlayerName}" in t_ko:
+                    raise RuntimeError(f"Unnormalized {{G_PlayerName}} remained in R2 {(sc, li, ii)}")
+
+                scripts[sc][(li, ii)] = {
+                    "lh": live_lh or rec_lh,
+                    "m": mode_int,
+                    "g": guard_sha,
+                    "t": t_ko,
+                }
+                if st == "REVIEW_REQUIRED":
+                    promo_stats["r2_review_required_included"] += 1
+                elif scope == "01a":
+                    promo_stats["r2_01a_promoted"] += 1
+                elif scope == "01b":
+                    promo_stats["r2_01b_promoted"] += 1
+                elif scope == "choice":
+                    promo_stats["r2_choices_promoted"] += 1
 
     scenario_index: Dict[str, Dict[str, Any]] = {}
     used_rel_paths: Dict[str, str] = {}
@@ -845,6 +945,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--bridge-zip", default=DEFAULT_BRIDGE_ZIP, help="Path to UI public patch bridge zip.")
     parser.add_argument("--final-r2-zip", default=DEFAULT_FINAL_R2_ZIP, help="Optional FRIDA FINAL 88,868 transfer R2 zip.")
     parser.add_argument("--crawler-extracted-dir", default=DEFAULT_CRAWLER_EXTRACTED_DIR, help="Optional live crawler extracted dir for guard/key verification.")
+    parser.add_argument("--r2-handoff-dir", default=DEFAULT_R2_HANDOFF_DIR, help="Optional FRIDA AG integrated translation handoff R2 directory.")
+    parser.add_argument(
+        "--include-review-required",
+        dest="include_review_required",
+        action="store_true",
+        default=True,
+        help="Include REVIEW_REQUIRED (e.g. preserved-Kanji) rows in CDN runtime (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-include-review-required",
+        dest="include_review_required",
+        action="store_false",
+        help="Exclude REVIEW_REQUIRED rows from CDN runtime.",
+    )
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR, help="Output CDN repository directory.")
     parser.add_argument(
         "--verify",
@@ -881,6 +995,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     final_r2_path = Path(args.final_r2_zip) if args.final_r2_zip else None
     crawler_ext_path = Path(args.crawler_extracted_dir) if args.crawler_extracted_dir else None
+    r2_handoff_path = Path(args.r2_handoff_dir) if args.r2_handoff_dir else None
 
     with zipfile.ZipFile(frida_zip_path, "r") as frida_zf:
         registry_freeze_id = extract_registry_freeze_id(frida_zf, frida_zip_path)
@@ -889,8 +1004,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             out_dir,
             final_r2_zip=final_r2_path,
             crawler_extracted_dir=crawler_ext_path,
+            r2_handoff_dir=r2_handoff_path,
+            include_review_required=args.include_review_required,
         )
-    if promo_stats.get("final_new_promoted", 0) > 0:
+    if (
+        promo_stats.get("r2_01a_promoted", 0)
+        + promo_stats.get("r2_01b_promoted", 0)
+        + promo_stats.get("r2_choices_promoted", 0)
+        > 0
+    ):
+        registry_freeze_id = "FRIDA_REV2_20261126_FINAL88868_PLUS_R2_INCREMENTAL"
+    elif promo_stats.get("final_new_promoted", 0) > 0:
         registry_freeze_id = "FRIDA_FINAL_BINARY_HOLD_MASTER_20261023_STAGE50_1_PREFERRED"
 
     with zipfile.ZipFile(bridge_zip_path, "r") as bridge_zf:
@@ -912,6 +1036,43 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if k and isinstance(v, str) and v.strip() and k not in ui_dict:
                     ui_dict[k] = v.strip()
                     extra_static_count += 1
+            ui_dict = {k: ui_dict[k] for k in sorted(ui_dict.keys())}
+
+    # Merge R2 accepted static UI (03_ui) and Naninovel AddChoice summaries (02_addchoice)
+    # into ui.json (never overwriting existing approved UI entries; LilyMod ChoiceHandlerPanel
+    # translates choice summaries via LilytransStore.TryTranslateUi).
+    r2_ui_merged = 0
+    r2_choice_ui_merged = 0
+    if r2_handoff_path and r2_handoff_path.is_dir():
+        r2_ui_file = r2_handoff_path / "02_integrated_stage_b" / "03_ui_STAGE_B_FROZEN_0012.jsonl"
+        if r2_ui_file.is_file():
+            for raw_line in r2_ui_file.read_text(encoding="utf-8").splitlines():
+                if not raw_line.strip():
+                    continue
+                rec = json.loads(raw_line)
+                if rec.get("review_status") != "READY_FOR_EXPLICIT_ACCEPTANCE":
+                    continue
+                src = str(rec.get("text") or "").strip()
+                ko = str(rec.get("translation_ko") or "").strip()
+                if src and ko and src not in ui_dict:
+                    ui_dict[src] = ko
+                    r2_ui_merged += 1
+
+        r2_ch_file = r2_handoff_path / "02_integrated_stage_b" / "02_addchoice_STAGE_B_FROZEN_0023.jsonl"
+        if r2_ch_file.is_file():
+            for raw_line in r2_ch_file.read_text(encoding="utf-8").splitlines():
+                if not raw_line.strip():
+                    continue
+                rec = json.loads(raw_line)
+                if rec.get("review_status") != "READY_FOR_EXPLICIT_ACCEPTANCE":
+                    continue
+                src = str(rec.get("source_jp") or "").strip()
+                ko = str(rec.get("translation_ko") or "").strip()
+                if src and ko and src not in ui_dict:
+                    ui_dict[src] = ko
+                    r2_choice_ui_merged += 1
+
+        if r2_ui_merged or r2_choice_ui_merged:
             ui_dict = {k: ui_dict[k] for k in sorted(ui_dict.keys())}
 
     core_specs: List[Tuple[str, str, Any, bool]] = [
@@ -965,6 +1126,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             "scenario_promotion": promo_stats,
             "ui_entries": len(ui_dict),
             "ui_extra_static_merged": extra_static_count,
+            "ui_r2_merged": r2_ui_merged,
+            "ui_r2_choices_merged": r2_choice_ui_merged,
             "ui_scoped_entries": len(ui_scoped_dict),
             "names_entries": len(names_dict),
             "api_dict_endpoints": len(api_dict),
